@@ -5,6 +5,7 @@ import os, time, imageio, tqdm, argparse
 import matplotlib.pyplot as plt
 import scipy.io as sio
 import numpy as np
+import tifffile
 
 import torch
 print(f"Using PyTorch Version: {torch.__version__}")
@@ -24,6 +25,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--root_dir', default='.', type=str)
     parser.add_argument('--data_dir', default='resized', type=str)
+
+    parser.add_argument('--ims_pth', type=str)
+    parser.add_argument('--mod_pth', type=str)
+
     parser.add_argument('--scene_name', default='0609', type=str)
     parser.add_argument('--num_epochs', default=1000, type=int)
     parser.add_argument('--num_t', default=100, type=int)
@@ -42,6 +47,11 @@ if __name__ == "__main__":
     parser.add_argument('--phs_layers', default=2, type=int)
     parser.add_argument('--dynamic_scene', action='store_true')
 
+    parser.add_argument('--phase_rot', default=0.0, type=float, help="rotate phase map, counter-clockwise")
+    parser.add_argument('--circular_mask', type=float)
+    #parser.add_argument('--rescale_min', default=0, type=float, help="if not 0, ")
+
+
     args = parser.parse_args()
     PSF_size = args.width
 
@@ -58,7 +68,7 @@ if __name__ == "__main__":
 
     ############
     # Training preparations
-    dset = BatchDataset(data_dir, num=args.num_t, im_prefix=args.im_prefix, max_intensity=args.max_intensity, zero_freq=args.zero_freq)
+    dset = TifDataset(data_dir, num=100, im_tif_pth=args.ims_pth, mod_tif_pth=args.mod_pth, max_intensity=args.max_intensity, zero_freq=args.zero_freq, circular_mask=args.circular_mask, phase_rot=args.phase_rot)
     x_batches = torch.cat(dset.xs, axis=0).unsqueeze(1).to(DEVICE)
     y_batches = torch.stack(dset.ys, axis=0).to(DEVICE)
 
@@ -108,7 +118,9 @@ if __name__ == "__main__":
                     I_est = I_est[0:1]
                 I_est = torch.clamp(I_est, 0, 1)
                 yy = F.conv2d(I_est, Abe_est, padding='same').squeeze(0)
-                gim = []
+
+                gim=[]
+
                 fig, ax = plt.subplots(1, 6, figsize=(56, 10))
                 gim.append(ax[0].imshow(y_batch[0].detach().cpu().squeeze(), vmin=0, vmax=1, cmap='gray'))
                 ax[0].title.set_text('Real Measurement')
@@ -171,14 +183,19 @@ if __name__ == "__main__":
     else:
         I_est = np.uint8(I_est.squeeze() * 255)
         imageio.imsave(f'{vis_dir}/final/final_I_est.png', I_est)
+        tifffile.imwrite(f'{vis_dir}/final/final_I_est.tif',I_est)
 
     if args.static_phase:
-        imageio.imsave(f'{vis_dir}/final/final_aberrations_angle.png', out_errs[0])
-        imageio.imsave(f'{vis_dir}/final/final_aberrations.png', out_abes[0])
+        imageio.imsave(f'{vis_dir}/final/final_aberrations_angle.png', out_errs[-1])
+        tifffile.imwrite(f'{vis_dir}/final/final_aberrations_angle.tif', out_errs[-1])
+
+        imageio.imsave(f'{vis_dir}/final/final_aberrations.png', out_abes[-1])
+        tifffile.imsave(f'{vis_dir}/final/final_aberrations.tif', out_abes[-1])
     else:
         imageio.mimsave(f'{vis_dir}/final/final_aberrations_angle_grey.gif', out_errs, duration=1000*1./30)
         imageio.mimsave(f'{vis_dir}/final/final_aberrations.gif', out_abes, duration=1000*1./30)
 
+    sio.savemat(f'{vis_dir}/final/sim_aberration0.mat', {'sim_g': est_g})
     print("Training concludes.")
 
     colored_err = []

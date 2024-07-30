@@ -1,0 +1,4 @@
+.vscode/
+__pycache__/
+neuws_exp_data/
+vis/
