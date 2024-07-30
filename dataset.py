@@ -8,7 +8,7 @@ import tifffile
 from torchvision import transforms
 
 class TifDataset(torch.utils.data.Dataset):
-    def __init__(self, data_dir, im_tif_pth=None, mod_tif_pth=None, num=100, max_intensity=0, zero_freq=-1, circular_mask=0, phase_rot = 0):
+    def __init__(self, data_dir, im_tif_pth=None, mod_tif_pth=None, num=100, max_intensity=0, zero_freq=-1, circular_mask=0, phase_rot = 0, rescale=(0, 0)):
         self.obs_pth = im_tif_pth
         self.mod_pth = mod_tif_pth
 
@@ -53,6 +53,7 @@ class TifDataset(torch.utils.data.Dataset):
         self.a_slm = torch.from_numpy(a_slm).type(torch.float)
         self.max_intensity = max_intensity
         self.num = num
+        self.rescale=rescale
         self.load_in_cache()
         self.num = len(self.mod)
         print(f'Training with {self.num} frames.')
@@ -70,7 +71,8 @@ class TifDataset(torch.utils.data.Dataset):
             p_SLM_train = torch.FloatTensor(p_SLM).unsqueeze(0)
 
             #---hard coded--- rescale
-            p_SLM_train = (p_SLM_train-p_SLM_train.min()+0.1)/(p_SLM_train.max()-p_SLM_train.min())*41000+3000
+            rescale_slope = self.rescale[0]-self.rescale[1] if self.rescale[0] else 1.0
+            p_SLM_train = (p_SLM_train-p_SLM_train.min()+0.1)/(p_SLM_train.max()-p_SLM_train.min())*rescale_slope+self.rescale[1]
 
             x_train = self.a_slm * torch.exp(1j * -1.0*p_SLM_train) #slm res mask * torch.exp(1j * phase in rad), phase in rad: unwrapped (1, 256, 256)
             y_train = self.obs[idx]

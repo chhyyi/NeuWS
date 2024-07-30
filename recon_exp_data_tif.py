@@ -49,7 +49,8 @@ if __name__ == "__main__":
 
     parser.add_argument('--phase_rot', default=0.0, type=float, help="rotate phase map, counter-clockwise")
     parser.add_argument('--circular_mask', type=float)
-    #parser.add_argument('--rescale_min', default=0, type=float, help="if not 0, ")
+    parser.add_argument('--rescale_max', default=0, type=float, help="if not 0, rescale to the range [rescale_min, rescale_max]")
+    parser.add_argument('--rescale_min', default=0, type=float, help="should be smaller than --rescale_max")
 
 
     args = parser.parse_args()
@@ -60,7 +61,7 @@ if __name__ == "__main__":
     data_dir = f'{args.root_dir}/{args.data_dir}'
     vis_dir = f'{args.root_dir}/vis/{args.scene_name}'
     os.makedirs(f'{args.root_dir}/vis', exist_ok=True)
-    os.makedirs(vis_dir, exist_ok=True)
+    os.makedirs(vis_dir, exist_ok=False)
     os.makedirs(f'{vis_dir}/final', exist_ok=True)
     print(f'Saving output at: {vis_dir}')
     if args.save_per_frame:
@@ -68,7 +69,7 @@ if __name__ == "__main__":
 
     ############
     # Training preparations
-    dset = TifDataset(data_dir, num=100, im_tif_pth=args.ims_pth, mod_tif_pth=args.mod_pth, max_intensity=args.max_intensity, zero_freq=args.zero_freq, circular_mask=args.circular_mask, phase_rot=args.phase_rot)
+    dset = TifDataset(data_dir, num=100, im_tif_pth=args.ims_pth, mod_tif_pth=args.mod_pth, max_intensity=args.max_intensity, zero_freq=args.zero_freq, circular_mask=args.circular_mask, phase_rot=args.phase_rot, rescale=(args.rescale_max, args.rescale_min))
     x_batches = torch.cat(dset.xs, axis=0).unsqueeze(1).to(DEVICE)
     y_batches = torch.stack(dset.ys, axis=0).to(DEVICE)
 
@@ -186,11 +187,12 @@ if __name__ == "__main__":
         tifffile.imwrite(f'{vis_dir}/final/final_I_est.tif',I_est)
 
     if args.static_phase:
-        imageio.imsave(f'{vis_dir}/final/final_aberrations_angle.png', out_errs[-1])
-        tifffile.imwrite(f'{vis_dir}/final/final_aberrations_angle.tif', out_errs[-1])
+        imageio.imsave(f'{vis_dir}/final/final_aberrations_angle.png', out_errs[0])
+        sio.savemat(f'{vis_dir}/final/sim_aberrations_angle.mat', {'aberrations_angle': out_errs[0]})
 
-        imageio.imsave(f'{vis_dir}/final/final_aberrations.png', out_abes[-1])
-        tifffile.imsave(f'{vis_dir}/final/final_aberrations.tif', out_abes[-1])
+        imageio.imsave(f'{vis_dir}/final/final_aberrations.png', out_abes[0])
+        sio.savemat(f'{vis_dir}/final/sim_aberrations.mat', {'aberrations': out_abes[0]})
+
     else:
         imageio.mimsave(f'{vis_dir}/final/final_aberrations_angle_grey.gif', out_errs, duration=1000*1./30)
         imageio.mimsave(f'{vis_dir}/final/final_aberrations.gif', out_abes, duration=1000*1./30)
