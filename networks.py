@@ -8,7 +8,10 @@ from torch.fft import fft2, fftshift
 
 import numpy as np
 import torchvision.transforms
-from utils import compute_zernike_basis, fft_2xPad_Conv2D
+
+from zern_utils import *
+from utils import batchwise_align_images, shift_correction, fft_2xPad_Conv2D, fft_noPad_Conv2D
+from syn_aber.zernike_aberration import fft2c, ifft2c
 
 
 class sine_act(nn.Module):
@@ -205,14 +208,14 @@ class G_SpaceTime(nn.Module):
 
 
 class TemporalZernNet(nn.Module):
-    def __init__(self, width, PSF_size, phs_layers = 2, use_FFT=True, bsize=8, use_pe=False, static_phase=True):
+    def __init__(self, width, PSF_size, phs_layers = 2, use_FFT=True, bsize=8, use_pe=False, static_phase=True,
+                 use_CTF=None, basis_mode='square', coherent_avg=False):
         super().__init__()
         self.g_im = G_PatchTensor(width)
 
         if not use_pe:
-            self.basis = nn.Parameter(compute_zernike_basis(
-                num_polynomials=28,
-                field_res=(PSF_size, PSF_size)).permute(1, 2, 0).unsqueeze(0).repeat(bsize, 1, 1, 1),
+            zern_basis = (compute_zernike_basis(num_polynomials=28, field_res=(256, 256), mode=basis_mode))
+            self.basis = nn.Parameter(zern_basis.permute(1, 2, 0).unsqueeze(0).repeat(bsize, 1, 1, 1),
                 requires_grad=False)
         else:
             xs = torch.linspace(-1, 1, steps=PSF_size)
@@ -248,6 +251,9 @@ class TemporalZernNet(nn.Module):
         self.use_FFT = use_FFT
         print(f'Using FFT approximation of convolution: {self.use_FFT}')
         self.static_phase = static_phase
+        self.use_CTF = use_CTF
+        self.coherent_avg = coherent_avg
+        self.bsize = bsize
 
     def get_estimates(self, t):
         I_est = self.g_im()
@@ -261,18 +267,25 @@ class TemporalZernNet(nn.Module):
 
         g_out = self.g_g(g_in)
         sim_phs = g_out.permute(0, 3, 1, 2)
-        sim_g = torch.exp(1j * sim_phs)
+        sim_g = self.use_CTF * torch.exp(1j * sim_phs)
 
         return I_est, sim_g, sim_phs
 
     def forward(self, x_batch, t):
         I_est, sim_g, sim_phs = self.get_estimates(t)
+
         _kernel = fftshift(fft2(sim_g * x_batch, norm="forward"), dim=[-2, -1]).abs() ** 2
         _kernel = _kernel / torch.sum(_kernel, dim=[-2, -1], keepdim=True)
         _kernel = _kernel.flip(2).flip(3)
 
+        if self.coherent_avg:
+            ideal_psf = torch.abs(ifft2c(self.use_CTF)) ** 2
+            ideal_psf = ideal_psf.expand(_kernel.shape[0], 1, -1, -1)
+            _kernel, _, _ = shift_correction(_kernel, ideal_psf, pad=False)
+        
         if self.use_FFT:
-            y = fft_2xPad_Conv2D(I_est, _kernel).squeeze()
+            # y = fft_2xPad_Conv2D(I_est, _kernel).squeeze()
+            y = fft_noPad_Conv2D(I_est, _kernel).squeeze()   # better result
         else:
             y = F.conv2d(I_est, _kernel, padding='same').squeeze()
 
@@ -280,8 +293,8 @@ class TemporalZernNet(nn.Module):
 
 
 class StaticDiffuseNet(TemporalZernNet):
-    def __init__(self, width, PSF_size, phs_layers = 2, use_FFT=True, bsize=8, use_pe=False, static_phase=True):
-        super().__init__(width, PSF_size, phs_layers = phs_layers, use_FFT=use_FFT, bsize=bsize, use_pe=use_pe)
+    def __init__(self, width, PSF_size, phs_layers = 2, use_FFT=True, bsize=8, use_pe=False, static_phase=True, use_CTF=None, coherent_avg=False):
+        super().__init__(width, PSF_size, phs_layers = phs_layers, use_FFT=use_FFT, bsize=bsize, use_pe=use_pe, use_CTF=use_CTF, coherent_avg=coherent_avg)
 
         hidden_dim = 32
         t_dim = 1 if not static_phase else 0
@@ -293,7 +306,7 @@ class StaticDiffuseNet(TemporalZernNet):
             layers.append(nn.Linear(hidden_dim, hidden_dim))
             # layers.append(nn.LayerNorm(hidden_dim))
             layers.append(act_fn)
-        layers.append(nn.Linear(hidden_dim, 2))
+        layers.append(nn.Linear(hidden_dim, 1))
         self.g_g = nn.Sequential(*layers)
         self.static_phase = static_phase
 
@@ -310,9 +323,18 @@ class StaticDiffuseNet(TemporalZernNet):
         g_out = self.g_g(g_in)
 
         g_out = g_out.permute(0, 3, 1, 2)
-        sim_phs = g_out[:, 1:2]
-        sim_amp = g_out[:, 0:1]
-        sim_g = sim_amp * torch.exp(1j * sim_phs)
+        if g_out.shape[1] == 2:
+            """
+            If the output channel of MLP is 2, the neural representation of aberration is also trained to estimate aperture mask.
+            """
+            
+            sim_phs = g_out[:, 1:2]
+            sim_amp = g_out[:, 0:1]
+            sim_g = sim_amp * torch.exp(1j * sim_phs)
+            # sim_g = torch.exp(1j * sim_phs)
+        else:
+            sim_phs = g_out[:, 0:1]
+            sim_g = self.use_CTF * torch.exp(1j * sim_phs)
 
         return I_est, sim_g, sim_phs
 
@@ -455,7 +477,3 @@ class MovingDiffuse(TemporalZernNet):
             y = torch.stack(y, axis=0)
 
         return y, _kernel, sim_g, sim_phs, I_est
-
-
-
-

@@ -1,143 +1,200 @@
-# Copyright (c) 2023 
-# Brandon Y. Feng, University of Maryland, College Park and Rice University. All rights reserved
-
-import os, tqdm, math, imageio
-from aotools.functions import zernikeArray
-import numpy as np
-import h5py
-
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision as tv
-from torch.fft import fft2, fftshift, irfftn, rfftn, ifftshift
-
-from PIL import Image
+import math
+import numpy as np
 import matplotlib.pyplot as plt
+import logging, os
+
+import torch.nn.functional as F
+
+from torch.fft import fftn, ifftn, rfftn, irfftn, fft2
+from torch.fft import fftshift as fft_shift, ifftshift as ifft_shift
 
 ang_to_unit = lambda x : ((x / np.pi) + 1) / 2
 
-def gen_moving_dataset(data_dir, num_frames=256):
-    nums_per_image = 1
-    original_size = 128
-    width, height = 224, 224
+def roll_torch(tensor, shift, axis):
+    """implements numpy roll() or Matlab circshift() functions for tensors"""
+    if shift == 0:
+        return tensor
 
-    lims = (x_lim, y_lim) = width - original_size, height - original_size
+    if axis < 0:
+        axis += tensor.dim()
 
-    #direcs = np.pi * (np.random.rand(nums_per_image) * 2 - 1)
-    direcs = np.array([0.97302908, -0.96160664])
-    #speeds = (np.random.randint(5, size=nums_per_image) + 2) / 10
-    speeds = np.array([0.2, 0.2]) * (128 / num_frames)
+    dim_size = tensor.size(axis)
+    after_start = dim_size - shift
+    if shift < 0:
+        after_start = -shift
+        shift = dim_size - abs(shift)
 
-    veloc = np.asarray([(speed * math.cos(direc), speed * math.sin(direc)) for direc, speed in zip(direcs, speeds)])
-    # Get a list containing two PIL images randomly sampled from the database
-    mnist_images = [Image.open(f'{data_dir}/digit_6.png').convert('L').resize((original_size, original_size),Image.ANTIALIAS), 
-                    Image.open(f'{data_dir}/digit_0.png').convert('L').resize((original_size, original_size),Image.ANTIALIAS)]
-    # Generate tuples of (x,y) i.e initial positions for nums_per_image (default : 2)
-    positions = np.asarray([[15, 15], [75, 75]])
+    before = tensor.narrow(axis, 0, dim_size - shift)
+    after = tensor.narrow(axis, after_start, shift)
+    return torch.cat([after, before], axis)
 
-    dataset = np.empty((num_frames, 128, 128), dtype=np.uint8)
+def ifftshift(tensor):
+    """ifftshift for tensors of dimensions [minibatch_size, num_channels, height, width, 2]
 
-    # Generate new frames for the entire num_framesgth
-    for frame_idx in range(num_frames):
+    shifts the width and heights
+    """
+    size = tensor.size()
+    tensor_shifted = roll_torch(tensor, -math.floor(size[-2] / 2.0), -2)
+    tensor_shifted = roll_torch(tensor_shifted, -math.floor(size[-1] / 2.0), -1)
+    return tensor_shifted
 
-        canvases = [Image.new('L', (width, height)) for _ in range(nums_per_image)]
-        canvas = np.zeros((1, width, height), dtype=np.float32)
 
-        # In canv (i.e Image object) place the image at the respective positions
-        # Super impose both images on the canvas (i.e empty np array)
-        for i, canv in enumerate(canvases):
-            canv.paste(mnist_images[i], tuple(positions[i].astype(int)))
-            canvas += np.asarray(canv)
+def fftshift(tensor):
+    """fftshift for tensors of dimensions [minibatch_size, num_channels, height, width, 2]
 
-        # Get the next position by adding velocity
-        next_pos = positions + veloc
+    shifts the width and heights
+    """
+    size = tensor.size()
+    tensor_shifted = roll_torch(tensor, math.floor(size[-2] / 2.0), -2)
+    tensor_shifted = roll_torch(tensor_shifted, math.floor(size[-1] / 2.0), -1)
+    return tensor_shifted
 
-        # Iterate over velocity and see if we hit the wall
-        # If we do then change the  (change direction)
-        for i, pos in enumerate(next_pos):
-            for j, coord in enumerate(pos):
-                if coord < -2 or coord > lims[j] + 2:
-                    veloc[i] = list(list(veloc[i][:j]) + [-1 * veloc[i][j]] + list(veloc[i][j + 1:]))
+def ifft2c(arr):
+    return ifftshift(ifftn(ifftshift(arr), norm="ortho"))
 
-        # Make the permanent change to position by adding updated velocity
-        positions = positions + veloc
-        frame_out = (canvas).clip(0, 255).astype(np.uint8)
-        dataset[frame_idx] = np.asarray(Image.fromarray(frame_out.squeeze()).resize((128, 128), Image.LANCZOS))
-    plt.imshow(dataset[0], cmap='gray')
+def fft2c(arr):
+    return fftshift(fftn(fftshift(arr), norm="ortho"))
 
-    imageio.mimsave(f'{data_dir}/moving_n{num_frames}.gif', dataset, duration=1000*1./60)
-    np.save(f'{data_dir}/moving_n{num_frames}.npy', dataset)
 
-def preprocess_sim_dynamic_data(DC, true_gs):
-    num = len(true_gs)
-    x_list = []
-    print('Loading into RAM')
-    for idx in tqdm.trange(num):
-      p_SLM_train = (torch.rand(1, DC.shape[-2], DC.shape[-1]).float() * 2 - 1) * np.pi
-      #p_SLM_train = (torch.randn(1, DC.shape[-2], DC.shape[-1]).float())
-      p_SLM_train = p_SLM_train
-      if idx % 100 == 0:
-        p_SLM_train = torch.zeros_like(p_SLM_train)
-      x_train = torch.exp(1j * p_SLM_train)
-      x_list.append(x_train)
+def compute_modulation(img, psf):
+    f_img, otf = fft2c(img), fft2c(psf)
+    f_res = (f_img * otf) / torch.abs(otf).max()
+    res = ifft2c(f_res)
+    
+    return res.abs()
+    
 
-    y_list = []
-    print('Preprocessing y_batch')
-    ys = []
-    y_min, y_max = 100, 0
-    for idx in tqdm.trange(num):
-      true_g = true_gs[idx].unsqueeze(0)
-      kernel = fftshift(fft2(true_g * x_list[idx].to(DC.device), norm="forward"), dim=[-2, -1]).abs() ** 2
-      kernel = kernel / torch.sum(kernel, dim=[-2, -1], keepdim=True)
-      kernel = kernel.unsqueeze(0)
-      kernel = kernel.flip(2).flip(3)
+def align_images(recon, ref):
+    """
+    This implementation is desinged to extract relative shift with respect to 'ref'.
+    To do so, the 'Cross-Correlation' in Fourier space is employed to find out the shift.
+    Input shapes: [1, H, W]
+    """
+    recon_zeromean = recon - torch.mean(recon, dim=(1,2), keepdim=True)
+    ref_zeromean = ref - torch.mean(ref, dim=(1,2), keepdim=True)
 
-      y = F.conv2d(DC[idx:(idx+1)].unsqueeze(0), kernel, padding='same').squeeze().cpu()
-      ys.append(y)
-      if y.min() < y_min: y_min = y.min() 
-      if y.max() > y_max: y_max = y.max() 
-    print(f'y_min: {y_min}, y_max: {y_max}')
-    for y in ys:
-      normalized_y = (y - y_min) / (y_max - y_min)
-      #normalized_y = y
-      y_list.append(normalized_y)
-    return x_list, y_list
+    recon_fft = fft2c(recon_zeromean)
+    ref_fft = fft2c(ref_zeromean)
 
-def crop_image(field, target_shape, pytorch=True, stacked_complex=True):
-    if target_shape is None:
-        return field
-    if pytorch:
-        if stacked_complex:
-            size_diff = np.array(field.shape[-3:-1]) - np.array(target_shape)
-            odd_dim = np.array(field.shape[-3:-1]) % 2
-        else:
-            size_diff = np.array(field.shape[-2:]) - np.array(target_shape)
-            odd_dim = np.array(field.shape[-2:]) % 2
+    cross_correlation = ifft2c(recon_fft * torch.conj(ref_fft))
+    # cross_correlation = ifft2c(torch.conj(recon_fft) * ref_fft)
+    cross_correlation = torch.abs(cross_correlation)
+
+    _, idx = torch.max(cross_correlation.view(1, -1), 1)
+    # max_row, max_col = idx // cross_correlation.shape[2], idx % cross_correlation.shape[2]
+    max_row = torch.div(idx, cross_correlation.shape[2], rounding_mode='floor')
+    max_col = torch.remainder(idx, cross_correlation.shape[2])
+
+    _, rows, cols = cross_correlation.shape
+    delM1 = (max_row.item() - rows // 2) % rows
+    delM2 = (max_col.item() - cols // 2) % cols
+
+    x_aligned = torch.roll(recon, shifts=(-delM1, -delM2), dims=(-2, -1))
+
+    return x_aligned, delM1, delM2
+
+
+def batchwise_align_images(recons, refs):
+    """
+    Applies align_images to each element in the batch.
+    Input shapes: [B, 1, H, W]
+    """
+    B, _, H, W = recons.shape
+    aligned_batch = []
+    delM1_batch = torch.zeros(B, dtype=torch.long)
+    delM2_batch = torch.zeros(B, dtype=torch.long)
+
+    for i in range(B):
+        aligned, delM1, delM2 = align_images(recons[i], refs[i])
+        aligned_batch.append(aligned.unsqueeze(0))
+        delM1_batch[i] = delM1
+        delM2_batch[i] = delM2
+        
+    aligned_batch = torch.cat(aligned_batch, dim=0)
+    return aligned_batch, delM1_batch, delM2_batch
+
+
+def shift_correction(recon, ref, pad=False):
+    B, C, H, W = recon.shape
+    
+    # Ensure inputs are float tensors
+    recon = recon.float()
+    ref = ref.float()
+    
+    # Remove mean
+    recon_zeromean = recon - recon.mean(dim=(-2, -1), keepdim=True)
+    ref_zeromean = ref - ref.mean(dim=(-2, -1), keepdim=True)
+    
+    if pad:
+        # Compute FFT
+        recon_fr = rfftn(recon_zeromean, dim=[-2, -1], s=[2*H, 2*W])
+        ref_fr = rfftn(ref_zeromean, dim=[-2, -1], s=[2*H, 2*W])
+    
+        # Compute cross-correlation (with conjugate)
+        cross_correlation_fr = complex_matmul(torch.conj(recon_fr), ref_fr)
+        # cross_correlation_fr = complex_matmul(torch.conj(ref_fr), recon_fr)
+    
+        # Inverse FFT to get spatial cross-correlation
+        cross_correlation = irfftn(cross_correlation_fr, dim=[-2, -1], s=[2*H, 2*W])
+    
+        # Find the maximum correlation for each image in the batch
+        _, idx = torch.max(cross_correlation.view(B, -1), 1)
+    
+        # Calculate the shift
+        max_row = torch.div(idx, (2*W), rounding_mode='floor')
+        max_col = torch.remainder(idx, (2*W))
+    
+        # Calculate the required shift
+        shift_row = torch.where(max_row > H, max_row - 2*H, max_row)
+        shift_col = torch.where(max_col > W, max_col - 2*W, max_col)
+    
+        # Apply the shift
+        grid_x = torch.arange(W, device=recon.device).repeat(H, 1)
+        grid_y = torch.arange(H, device=recon.device).unsqueeze(1).repeat(1, W)
+    
+        grid_x = (grid_x.unsqueeze(0) - shift_col.view(B, 1, 1)) % W
+        grid_y = (grid_y.unsqueeze(0) - shift_row.view(B, 1, 1)) % H
+    
+        grid = torch.stack((grid_x / (W - 1) * 2 - 1, grid_y / (H - 1) * 2 - 1), dim=-1)
+    
+        x_aligned = F.grid_sample(recon, grid.repeat(C, 1, 1, 1), mode='bilinear', padding_mode='border', align_corners=True)
+        
+        return x_aligned, shift_row, shift_col
+        
     else:
-        size_diff = np.array(field.shape[-2:]) - np.array(target_shape)
-        odd_dim = np.array(field.shape[-2:]) % 2
-    # crop dimensions that need to decrease in size
-    if (size_diff > 0).any():
-        crop_total = np.maximum(size_diff, 0)
-        crop_front = (crop_total + 1 - odd_dim) // 2
-        crop_end = (crop_total + odd_dim) // 2
+        recon_fr = rfftn(recon_zeromean, dim=[-2, -1])
+        ref_fr = rfftn(ref_zeromean, dim=[-2, -1])
+        
+        cross_correlation_fr = (recon_fr) * torch.conj(ref_fr)
+        cross_correlation = irfftn(cross_correlation_fr, dim=[-2, -1], s=[-1, -1])
+        cross_correlation = ifft_shift(cross_correlation, dim=[-2, -1])
+        cross_correlation = torch.abs(cross_correlation)
+        
+        # x_aligned, delM1, delM2 = batchwise_align_images(recon, ref)
+        
+        # Find the maximum correlation for each image in the batch
+        _, idx = torch.max(cross_correlation.view(B, -1), 1)
+        
+        B, _, H, W = cross_correlation.shape
+        max_row = torch.div(idx, W, rounding_mode='floor')
+        max_col = torch.remainder(idx, W)
+    
+        delM1 = (max_row - H // 2) % H
+        delM2 = (max_col - W // 2) % W
+    
+        # Apply the shift using roll for each image in the batch
+        x_aligned = []
+        for i in range(B):
+            x_aligned.append(torch.roll(recon[i], shifts=(-delM1[i].item(), -delM2[i].item()), dims=(-2, -1)))
+        x_aligned = torch.stack(x_aligned)
+    
+        return x_aligned, delM1, delM2
 
-        crop_slices = [slice(int(f), int(-e) if e else None)
-                       for f, e in zip(crop_front, crop_end)]
-        if pytorch and stacked_complex:
-            return field[(..., *crop_slices, slice(None))]
-        else:
-            return field[(..., *crop_slices)]
-    else:
-        return field
+    
 
-def compute_zernike_basis(num_polynomials, field_res):
-    zernike_diam = int(np.ceil(np.sqrt(field_res[0]**2 + field_res[1]**2)))
-    zernike = zernikeArray(num_polynomials, zernike_diam)
-    zernike = crop_image(zernike, field_res, pytorch=False)
-    zernike = torch.FloatTensor(zernike)
-    return zernike
+# ============================================================================================================
+
 
 # https://github.com/fkodom/fft-conv-pytorch
 
@@ -170,7 +227,7 @@ def fft_noPad_Conv2D(signal, kernel):
     output_fr = signal_fr * kernel_fr
     #output_fr = complex_matmul(signal_fr, kernel_fr)
     output = irfftn(output_fr, dim=[-2, -1], s=[-1, -1])
-    output = ifftshift(output, dim=[-2, -1])
+    output = ifft_shift(output, dim=[-2, -1])
 
     return output
 
@@ -187,168 +244,38 @@ def fft_2xPad_Conv2D(signal, kernel, groups=1):
 
     return output
 
-def preprocess_data(DC, true_gs):
-    num = len(true_gs)
-    x_list = []
-    print('Preprocessing x_batch')
-    for idx in range(num):
-      #p_SLM_train = np.pi * (2 * torch.rand(1, DC.shape[-2], DC.shape[-1]).float() - 1)
-      rand_patterns = 2 * torch.rand(1, 1, 4, 4).float() - 1
-      size = (DC.shape[-2], DC.shape[-1])
-      rand_patterns = tv.transforms.Resize(size)(rand_patterns)
-      p_SLM_train = np.pi * rand_patterns.squeeze(0)
-      if idx == -1:
-        p_SLM_train = torch.zeros_like(p_SLM_train)
-      x_train = torch.exp(1j * p_SLM_train)
-      x_list.append(x_train)
-    y_list = []
-    print('Preprocessing y_batch')
-    for idx in range(num):
-        kernel = fftshift(fft2(true_gs[idx].unsqueeze(0) * x_list[idx].to(DC.device), norm="forward"), dim=[-2, -1]).abs() ** 2
-        kernel = kernel / torch.sum(kernel, dim=[-2, -1], keepdim=True)
-        kernel = kernel.unsqueeze(0)
-        y = F.conv2d(DC.unsqueeze(0), kernel, padding='same').squeeze().cpu()
-        y_list.append(y)
-    return x_list, y_list
+def gen_point_spread_function(phs):
+    psf = fft_shift(fft2(phs, norm="forward"), dim=[-2, -1]).abs() ** 2
+    psf = psf / torch.sum(psf, dim=[-2, -1], keepdim=True)
+    psf = psf.flip(-2).flip(-1)
+    
+    return psf
 
+# ============================================================================================================
 
-import scipy.io as sio
-import torchvision
-def preprocess_data2(DC, true_gs, width=128):
-    num = len(true_gs)
-    x_list = []
-    data_dir = 'data/0725'
-    slm_prefix = 'SLM_sim'
-    print('Preprocessing x_batch')
-    resize = torchvision.transforms.Resize((width, width), interpolation=torchvision.transforms.InterpolationMode.NEAREST)
+def set_logger(save_path, log_name):
+    os.makedirs(save_path, exist_ok=True)
 
-    for idx in range(num):
-        mat_name = f'{data_dir}/{slm_prefix}{idx+1}.mat'
-        p_SLM = sio.loadmat(f'{mat_name}')
-        p_SLM = p_SLM['proj_sim']
-        if idx == 0:
-            aperture = np.ones_like(p_SLM)
-            aperture = np.lib.pad(aperture, (((256 - 144) // 2, (256 - 144) // 2), (0, 0)), 'constant', constant_values=(0, 0))
-            aperture = torch.FloatTensor(aperture).unsqueeze(0)
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
 
-        p_SLM = np.lib.pad(p_SLM, (((256 - 144) // 2, (256 - 144) // 2), (0, 0)), 'constant', constant_values=(0, 0))
-        p_SLM_train = torch.FloatTensor(p_SLM).unsqueeze(0)
-        p_SLM_train = resize(p_SLM_train)
-        aperture = resize(aperture)
-        x_train = aperture * torch.exp(1j * p_SLM_train)
-        x_list.append(x_train)
-    y_list = []
-    print('Preprocessing y_batch')
-    for idx in range(num):
-      kernel = fftshift(fft2(true_gs[idx].unsqueeze(0) * x_list[idx].to(DC.device), norm="forward"), dim=[-2, -1]).abs() ** 2
-      kernel = kernel / torch.sum(kernel, dim=[-2, -1], keepdim=True)
-      kernel = kernel.unsqueeze(0)
-      y = F.conv2d(DC.unsqueeze(0), kernel, padding='same').squeeze().cpu()
-      y_list.append(y)
-    return x_list, y_list
+    formatter = logging.Formatter('[%(asctime)s] - %(message)s')
 
-def get_weights(net):
-    """ Extract parameters from net, and return a list of tensors"""
-    return [p.data for p in net.parameters()]
+    file_handler = logging.FileHandler(os.path.join(save_path, log_name))
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
 
-def get_random_weights(weights):
-    """
-        Produce a random direction that is a list of random Gaussian tensors
-        with the same shape as the network's weights, so one direction entry per weight.
-    """
-    return [torch.randn(w.size()) for w in weights]
+    return logger
 
-def normalize_directions_for_weights(direction, weights, norm='filter', ignore='biasbn'):
-    """
-        The normalization scales the direction entries according to the entries of weights.
-    """
-    assert(len(direction) == len(weights))
-    for d, w in zip(direction, weights):
-        if d.dim() <= 1:
-            if ignore == 'biasbn':
-                d.fill_(0) # ignore directions for weights with 1 dimension
-            else:
-                d.copy_(w) # keep directions for weights/bias that are only 1 per node
-        else:
-            normalize_direction(d, w, norm)
-
-def normalize_direction(direction, weights, norm='filter'):
-    """
-        Rescale the direction so that it has similar norm as their corresponding
-        model in different levels.
-        Args:
-          direction: a variables of the random direction for one layer
-          weights: a variable of the original model for one layer
-          norm: normalization method, 'filter' | 'layer' | 'weight'
-    """
-    if norm == 'filter':
-        # Rescale the filters (weights in group) in 'direction' so that each
-        # filter has the same norm as its corresponding filter in 'weights'.
-        for d, w in zip(direction, weights):
-            d.mul_(w.norm()/(d.norm() + 1e-10))
-    elif norm == 'layer':
-        # Rescale the layer variables in the direction so that each layer has
-        # the same norm as the layer variables in weights.
-        direction.mul_(weights.norm()/direction.norm())
-    elif norm == 'weight':
-        # Rescale the entries in the direction so that each entry has the same
-        # scale as the corresponding weight.
-        direction.mul_(weights)
-    elif norm == 'dfilter':
-        # Rescale the entries in the direction so that each filter direction
-        # has the unit norm.
-        for d in direction:
-            d.div_(d.norm() + 1e-10)
-    elif norm == 'dlayer':
-        # Rescale the entries in the direction so that each layer direction has
-        # the unit norm.
-        direction.div_(direction.norm())
-
-def create_random_direction(net, dir_type, ignore='biasbn', norm='filter'):
-    # random direction
-    weights = get_weights(net) # a list of parameters.
-    direction = get_random_weights(weights)
-    direction = [d.to("cuda") for d in direction]
-    normalize_directions_for_weights(direction, weights, norm, ignore)
-
-    return direction
-
-def setup_directions(net, dir_type='weights', xignore='biasbn', xnorm='filter'):
-    xdirection = create_random_direction(net, dir_type, xignore, xnorm)
-    ydirection = create_random_direction(net, dir_type, xignore, xnorm)
-
-    return [xdirection, ydirection]
-
-def set_weights(net, weights, directions=None, step=None):
-    """
-        Overwrite the network's weights with a specified list of tensors
-        or change weights along directions with a step size.
-    """
-    dx, dy = directions[0], directions[1]
-    changes = [d0*step[0] + d1*step[1] for (d0, d1) in zip(dx, dy)]
-    for (p, w, d) in zip(net.parameters(), weights, changes):
-        p.data = w + torch.Tensor(d).type(type(w)).to(w.device)
-
-def write_dir(dir_file, xdirection, ydirection):
-    f = h5py.File(dir_file,'w')
-    write_list(f, 'xdirection', xdirection)
-    write_list(f, 'ydirection', ydirection)
-
-def write_list(f, name, direction):
-    """ Save the direction to the hdf5 file with name as the key
-        Args:
-            f: h5py file object
-            name: key name_surface_file
-            direction: a list of tensors
-    """
-
-    grp = f.create_group(name)
-    for i, l in enumerate(direction):
-        if isinstance(l, torch.Tensor):
-            l = l.cpu().numpy()
-        grp.create_dataset(str(i), data=l)
-
-def read_list(f, name):
-    """ Read group with name as the key from the hdf5 file and return a list numpy vectors. """
-    grp = f[name]
-    return [grp[str(i)] for i in range(len(grp))]
+def evaluate_iqa_metric(pred, ref, iqa_lists, device='cuda'):
+    eval_lists = []
+    
+    pred = pred.expand(1, 1, -1, -1).to(device)
+    ref = ref.expand(1, 1, -1, -1).to(device)
+    
+    for iqa in iqa_lists:
+        metric = iqa(pred, ref).cpu().mean().item()
+        eval_lists.append(metric)
+        
+    return eval_lists
+        
