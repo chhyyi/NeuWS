@@ -1,4 +1,6 @@
-.vscode/
-__pycache__/
-neuws_exp_data/
 vis/
+hw_0801/
+__pycache__/
+datasets/
+.vscode/
+neuws_exp_data/

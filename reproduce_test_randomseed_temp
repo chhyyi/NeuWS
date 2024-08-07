@@ -1,0 +1,10 @@
+# %%
+from data import RealDataset
+import matplotlib.pyplot as plt
+import torch
+data_dir = r"datasets\dataset8.02\dataset1\loworderrandomfixedab.tiff"
+gt_dir = r"datasets\dataset8.02\dataset1\GTimage8umdepth20avf15%pw.tif"
+dset = RealDataset(target_dir=data_dir, gt_dir=gt_dir)
+
+ang0 = torch.angle(dset[0][0])
+plt.imshow(ang0[0])
